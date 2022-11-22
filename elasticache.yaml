@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Setup ElasticCache.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Description: This is used as ClusterName for the ElastiCache.
+    Default: elastic-cache
+
+  PrimaryAvailabilityZone:
+    Description: Primary Availability Zone
+    Type: String
+    Default: "us-east-1a"
+
+  ReplicaAvailabilityZone1:
+    Description: Replica Availability Zone. We need it since we have more than 1 replicas.
+    Type: String
+    Default: "us-east-1b"
+
+  ReplicaAvailabilityZone2:
+    Description: Replica Availability Zone.We need it since we have more than 1 replicas.
+    Type: String
+    Default: "us-east-1c"
+
+  CacheEngine:
+    Type: String
+    Default: "redis"
+
+  CacheEngineVersion:
+    Type: String
+    Default: "7.0"
+
+  RedisPort:
+    Type: Number
+    Default: "6379"
+
+  usecase:
+    Description: What environment should be deployed
+    Type: String
+    AllowedValues:
+      - "prod"
+      - "stage"
+      - "dev"
+    Default: prod
+  SubnetIda:
+    Description: Choose which subnets the ElasticCache should be deployed to (select EKS PrivateA subnet)
+    Type: AWS::EC2::Subnet::Id
+
+  SubnetIdb:
+    Description: Choose which subnets the ElasticCache should be deployed to (select EKS PrivateB subnet)
+    Type: AWS::EC2::Subnet::Id
+
+  SubnetIdc:
+    Description: Choose which subnets the ElasticCache should be deployed to (select EKS PrivateC subnet)
+    Type: AWS::EC2::Subnet::Id
+
+  SecurityGroup:
+    Description: Select the Security Group to use for the ElasticCache cluster. (select EKS Security Group)
+    Type: AWS::EC2::SecurityGroup::Id
+
+Mappings:
+  ElasticCacheNode:
+    CacheNodeType:
+      prod: cache.t3.medium
+      stage: cache.t3.small
+      dev: cache.t3.micro
+
+  ElasticCacheReplicaCount:
+    ReplicaCount:
+      prod: "2"
+      stage: "2"
+      dev: "2"
+
+Resources:
+  CacheKMS:
+    Type: "AWS::KMS::Key"
+    Properties:
+      Description: Symmetric encryption KMS key for ElasticCache.
+      EnableKeyRotation: true
+      PendingWindowInDays: 20
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          # - Sid: Allow administration of the key
+          #   Effect: Allow
+          #   Principal:
+          #     AWS:
+          #     - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_SRE_*'
+          #     - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAcces_*'
+          #   Action:
+          #     - 'kms:Create*'
+          #     - 'kms:Describe*'
+          #     - 'kms:Enable*'
+          #     - 'kms:List*'
+          #     - 'kms:Put*'
+          #     - 'kms:Update*'
+          #     - 'kms:Revoke*'
+          #     - 'kms:Disable*'
+          #     - 'kms:Get*'
+          #     - 'kms:Delete*'
+          #     - 'kms:ScheduleKeyDeletion'
+          #     - 'kms:CancelKeyDeletion'
+          #   Resource: '*'
+          # - Sid: Allow use of the key
+          #   Effect: Allow
+          #   Principal:
+          #     AWS: 'arn:aws:iam::111122223333:role/Developer'
+          #   Action:
+          #     - 'kms:Sign'
+          #     - 'kms:Verify'
+          #     - 'kms:DescribeKey'
+          #   Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+        - Key: Service
+          Value: ElastiCache
+        - Key: Env
+          Value: !Ref usecase
+        - Key: Region
+          Value: !Ref "AWS::Region"
+  CacheKMSAlias:
+    Type: "AWS::KMS::Alias"
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-cache-${usecase}
+      TargetKeyId: !Ref CacheKMS
+  # Subnet group to control where the ElastiCache (Redis) gets placed
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    DependsOn: ElastiCacheLogGroup
+    Properties:
+      CacheSubnetGroupName: !Sub "${AWS::StackName}-subnetgroup"
+      Description: !Sub "${AWS::StackName}-ElastiCacheSubnetGroup"
+      SubnetIds:
+        - !Ref "SubnetIda"
+        - !Ref "SubnetIdb"
+        - !Ref "SubnetIdc"
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+        - Key: Service
+          Value: ElastiCache
+        - Key: Env
+          Value: !Ref usecase
+        - Key: Region
+          Value: !Ref "AWS::Region"
+
+  # The ElastiCache itself.
+  ReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    # UpdateReplacePolicy: Retain
+    # DependsOn: "ParameterGroup"
+    Properties:
+      AutoMinorVersionUpgrade: true
+      CacheNodeType: !FindInMap [ElasticCacheNode, CacheNodeType, !Ref usecase]
+      CacheParameterGroupName: !Ref ParameterGroup
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      Engine: !Ref CacheEngine
+      EngineVersion: !Ref CacheEngineVersion
+      MultiAZEnabled: true
+      TransitEncryptionEnabled: true
+      # Backup
+      PreferredMaintenanceWindow: sun:23:00-mon:01:30
+      SnapshotRetentionLimit: 7
+      SnapshotWindow: "03:30-05:30"
+      # used to encrypt the disk on the cluster
+      KmsKeyId: !GetAtt CacheKMS.KeyId
+      # LogDeliveryConfigurations:
+      #   - DestinationDetails:
+      #       CloudWatchLogsDetails:
+      #         LogGroup: !Ref ElastiCacheLogGroup
+      #     DestinationType: cloudwatch-logs
+      #     LogFormat: json
+      #     LogType: engine-log
+      NodeGroupConfiguration:
+        - PrimaryAvailabilityZone: !Sub "${PrimaryAvailabilityZone}"
+          ReplicaAvailabilityZones:
+            - !Sub "${ReplicaAvailabilityZone1}"
+            - !Sub "${ReplicaAvailabilityZone2}"
+          ReplicaCount:
+            !FindInMap [ElasticCacheReplicaCount, ReplicaCount, !Ref usecase]
+      Port: !Ref RedisPort
+      ReplicationGroupDescription: !Sub "${AWS::StackName}-${usecase}-ElastiCache-ReplicationGroup"
+      ReplicationGroupId: !Sub "${AWS::StackName}-replicationgroup"
+      UserGroupIds:
+        - !Ref CacheUserGroup
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+        - Key: Service
+          Value: ElastiCache
+        - Key: Env
+          Value: !Ref usecase
+        - Key: Region
+          Value: !Ref "AWS::Region"
+
+  # The ElastiCache dedicated ParameterGroup
+  ParameterGroup:
+    Type: "AWS::ElastiCache::ParameterGroup"
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      CacheParameterGroupFamily: redis7
+      Description: !Sub "${AWS::StackName}-ParameterGroup"
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+        - Key: Service
+          Value: ElastiCache
+        - Key: Env
+          Value: !Ref usecase
+        - Key: Region
+          Value: !Ref "AWS::Region"
+
+  # Redis Engine logs
+  ElastiCacheLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/redis/instance/${AWS::StackName}-${usecase}"
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+        - Key: Service
+          Value: ElastiCache
+        - Key: Env
+          Value: !Ref usecase
+        - Key: Region
+          Value: !Ref "AWS::Region"
+  # ------------------------------------------------------------#
+  # Store ElastiCache User password in SecretsManager
+  # ------------------------------------------------------------#
+  CacheUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      # Elastic cache authentication
+      Name: !Sub ${AWS::StackName}-${usecase}
+      Description: "Secret with dynamically generated password."
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "default"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\&'
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+        - Key: Service
+          Value: ElastiCache
+        - Key: Env
+          Value: !Ref usecase
+        - Key: Region
+          Value: !Ref "AWS::Region"
+
+  # ------------------------------------------------------------#
+  # ElastiCache Users
+  # ------------------------------------------------------------#
+  ElastiCacheUser:
+    Type: AWS::ElastiCache::User
+    Properties:
+      AccessString: "on ~* +@all" # < access to all available keys and commands.
+      Engine: redis
+      NoPasswordRequired: false
+      Passwords:
+        - !Sub "{{resolve:secretsmanager:${CacheUserSecret}::password}}"
+      UserId: !Sub ${AWS::StackName}-${usecase}
+      UserName: !Sub "{{resolve:secretsmanager:${CacheUserSecret}::username}}"
+
+  CacheUserGroup:
+    DependsOn: ElastiCacheUser
+    Type: AWS::ElastiCache::UserGroup
+    Properties:
+      Engine: redis
+      UserGroupId: !Sub ${AWS::StackName}-${usecase}
+      UserIds:
+        - !GetAtt ElastiCacheUser.UserId
+      #  - "default" # needs to contain a user with the user name default
+      #  - !Sub ${AWS::StackName}-${usecase}
+
+  # ------------------------------------------------------------#
+  # SSM Parameter Exports
+  # ------------------------------------------------------------#
+  parameterPrimaryEndpointAddress:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: !Sub "${AWS::StackName} ${usecase} ElastiCache PrimaryEndPoint"
+      Name: !Sub "/${usecase}/infrastructure/redis-PrimaryEndPoint"
+      Type: String
+      Value: !GetAtt ReplicationGroup.PrimaryEndPoint.Address
+      Tags:
+        Name: !Sub ${AWS::StackName}
+        Service: ElastiCache
+        Env: !Ref usecase
+        Region: !Ref "AWS::Region"
+  parameterReaderEndPointAddress:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: !Sub "${AWS::StackName} ${usecase} ElastiCache ReaderEndPoint"
+      Name: !Sub "/${usecase}/infrastructure/redis-ReaderEndPoint"
+      Type: String
+      Value: !GetAtt ReplicationGroup.ReaderEndPoint.Address
+      Tags:
+        Name: !Sub ${AWS::StackName}
+        Service: ElastiCache
+        Env: !Ref usecase
+        Region: !Ref "AWS::Region"
+
+Outputs:
+  CachePrimaryEndpointAddress:
+    Value: !GetAtt ReplicationGroup.ReaderEndPoint.Address
+
+  CacheReaderEndPointAddress:
+    Value: !GetAtt ReplicationGroup.ReaderEndPoint.Address
